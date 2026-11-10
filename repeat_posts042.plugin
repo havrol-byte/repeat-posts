@@ -1,0 +1,799 @@
+from secrets import randbits
+from time import time, strftime
+
+from android_utils import run_on_ui_thread
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment, get_selected_account
+from java.lang import Integer, Long
+from org.telegram.tgnet import TLRPC
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Selector, Switch, Text
+
+try:
+    from org.telegram.tgnet.tl import TL_update
+except ImportError:
+    TL_update = TLRPC
+
+__id__ = "repeat_posts"
+__name__ = "Повтор сообщений"
+__description__ = "Отправка объявлений с текстом и фото по расписанию."
+__author__ = "Codex"
+__version__ = "0.4.2"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.4.3"
+
+MAX_PERIOD = 7 * 24 * 60 * 60
+MESSAGE_LIMIT = 4096
+PHOTO_LIMIT = 10
+CHAT_PAGE_SIZE = 36
+INTERVAL_UNITS = (("Минуты", "мин", 60), ("Секунды", "с", 1))
+
+
+def tl_name(obj):
+    # Some builds put updates in tgnet.tl.TL_update instead of TLRPC.
+    return str(obj.getClass().getSimpleName()) if hasattr(obj, "getClass") else type(obj).__name__
+
+
+def split_text(text):
+    while text:
+        units = 0
+        end = 0
+        for char in text:
+            units += 2 if ord(char) > 0xFFFF else 1
+            if units > MESSAGE_LIMIT:
+                break
+            end += 1
+        if end < len(text):
+            boundary = max(text.rfind("\n", end // 2, end),
+                           text.rfind(" ", end // 2, end))
+            if boundary >= 0:
+                end = boundary + 1
+        part, text = text[:end], text[end:]
+        if part.strip():
+            yield part
+
+
+def confirmed_message_ids(response, random_ids):
+    name = tl_name(response)
+    if len(random_ids) == 1 and name in (
+        "TL_updateShortSentMessage", "TL_updateShortMessage", "TL_updateShortChatMessage",
+    ):
+        return [int(response.id)] if response.id > 0 else []
+    if name == "TL_updateShort":
+        entries = [response.update]
+    else:
+        updates = getattr(response, "updates", None)
+        entries = (updates.get(index) for index in range(updates.size())) if updates is not None else ()
+    mapped = {
+        int(update.random_id): int(update.id) for update in entries
+        if tl_name(update) == "TL_updateMessageID" and update.id > 0
+    }
+    return [mapped[random_id] for random_id in random_ids if random_id in mapped]
+
+
+class RepeatPostsPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.loaded = True
+        self.job = self.get_setting("job", None)
+        self.generation = 0
+        self.inflight = None
+        self.round_active = False
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="В список / убрать",
+            on_click=self.toggle_chat,
+        ))
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Фото в объявление",
+            on_click=self.add_photo,
+        ))
+        if self.job and self.job["enabled"]:
+            self.plan(self.generation)
+
+    def on_plugin_unload(self):
+        self.loaded = False
+
+    def create_settings(self):
+        owner = self.account_id(get_selected_account())
+        selected = self.get_setting(f"chats_{owner}", [])
+        job = self.job or {}
+        status = "Активно" if job.get("enabled") else "Остановлено"
+        body = str(self.get_setting("body", ""))
+        photos = self.get_setting(f"photos_{owner}", [])
+        return [
+            Header(text="Настройки следующего запуска"),
+            Text(text=f"Чаты · {len(selected)}",
+                 subtext="Добавить или убрать", on_click=self.manage_chats),
+            Text(text="Текст объявления",
+                 subtext=f"{len(body)} симв. · Изменить" if body else "Открыть редактор",
+                 on_click=self.edit_body),
+            Text(text=f"Фотографии · {len(photos)}", subtext="Выбрать из «Избранного»",
+                 on_click=self.manage_photos),
+            Input(key="interval", text="Интервал", default=self.get_setting("minutes", "60")),
+            Selector(key="interval_unit", text="Единица", default=0,
+                     items=[name for name, _, _ in INTERVAL_UNITS]),
+            Switch(key="replace_old", text="Удалять предыдущее", default=False),
+            Text(text="Старт", subtext="Первая отправка сразу", on_click=self.start),
+            Text(text="Стоп", on_click=self.stop),
+            Header(text=status),
+            Text(text="Последнее событие",
+                 subtext=self.get_setting("status", "Заданий ещё не было."),
+                 on_click=self.show_status),
+        ]
+
+    def edit_body(self, _view):
+        from android.text import InputType
+        from android.view import Gravity, View
+        from android.widget import EditText
+        from org.telegram.messenger import AndroidUtilities
+        from org.telegram.ui.ActionBar import Theme
+
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if activity is None:
+            return
+        dp = AndroidUtilities.dp
+        editor = EditText(activity)
+        editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE)
+        editor.setSingleLine(False)
+        editor.setHorizontallyScrolling(False)
+        editor.setMinLines(3)
+        editor.setMaxLines(8)
+        editor.setOverScrollMode(View.OVER_SCROLL_IF_CONTENT_SCROLLS)
+        editor.setVerticalScrollBarEnabled(True)
+        editor.setGravity(Gravity.TOP | Gravity.START)
+        editor.setPadding(dp(20), dp(12), dp(20), dp(12))
+        editor.setTextSize(16.0)
+        editor.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        editor.setHint("Вставь или напиши объявление")
+        editor.setText(str(self.get_setting("body", "")))
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Текст объявления")
+        builder.set_view(editor)
+
+        def save(dialog, _index):
+            self.set_setting("body", str(editor.getText().toString()), reload_settings=True)
+            dialog.dismiss()
+
+        builder.set_positive_button("Сохранить", save)
+        builder.set_negative_button("Отмена")
+        builder.show()
+
+    def add_photo(self, context):
+        slot = context.get("account")
+        selected = context.get("message")
+        if slot is None or selected is None:
+            BulletinHelper.show_error("Открой меню фотографии в «Избранном».")
+            return
+        slot = int(slot)
+        owner = self.account_id(slot)
+        if not owner or int(selected.getDialogId()) != owner:
+            BulletinHelper.show_error("Добавь фото через «Избранное» этого аккаунта.")
+            return
+        grouped = context.get("groupedMessages")
+        group_items = getattr(grouped, "messages", None)
+        candidates = [selected]
+        if group_items is not None and hasattr(group_items, "size"):
+            candidates = [group_items.get(i) for i in range(group_items.size())]
+        ids = sorted({
+            int(item.getId()) for item in candidates
+            if int(item.getDialogId()) == owner and int(item.getId()) > 0
+            and tl_name(item.messageOwner.media) == "TL_messageMediaPhoto"
+        })
+        if not ids:
+            BulletinHelper.show_error("Выбери уже отправленную фотографию.")
+            return
+        key = f"photos_{owner}"
+        current = list(self.get_setting(key, []))
+        photos = list(dict.fromkeys(current + ids))
+        if len(photos) > PHOTO_LIMIT:
+            BulletinHelper.show_error(f"Можно добавить до {PHOTO_LIMIT} фотографий.")
+            return
+        self.set_setting(key, photos)
+        BulletinHelper.show_info(f"Фото в объявлении: {len(photos)}.")
+
+    def manage_photos(self, _view=None):
+        slot = int(get_selected_account())
+        owner = self.account_id(slot)
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if not owner or activity is None:
+            return
+        key = f"photos_{owner}"
+        photos = self.get_setting(key, [])
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Фотографии")
+        builder.set_message("В «Избранном» открой меню фото и нажми «Фото в объявление».")
+
+        def remove(dialog, index):
+            if self.account_id(slot) != owner:
+                return
+            self.set_setting(key, [photo for photo in self.get_setting(key, [])
+                                   if photo != photos[index]], reload_settings=True)
+            dialog.dismiss()
+            self.manage_photos()
+
+        if photos:
+            builder.set_items([f"Убрать фото {i + 1}" for i in range(len(photos))], remove)
+
+        def open_saved(dialog, _index):
+            from android.os import Bundle
+            from org.telegram.ui import ChatActivity
+
+            if self.account_id(slot) != owner or get_selected_account() != slot:
+                BulletinHelper.show_error("Аккаунт сменился.")
+                return
+            args = Bundle()
+            args.putLong("user_id", owner)
+            dialog.dismiss()
+            fragment.presentFragment(ChatActivity(args))
+
+        builder.set_positive_button("Открыть «Избранное»", open_saved)
+        builder.set_negative_button("Закрыть")
+        builder.show()
+
+    def account_id(self, slot):
+        user = self.client(slot).get_user_config().getCurrentUser()
+        return int(user.id) if user is not None else 0
+
+    def dialog_object(self, controller, peer):
+        if peer > 0:
+            user = controller.getUser(Long(peer))
+            return None if user is None or getattr(user, "deleted", False) else user
+        return controller.getChat(Long(-peer)) if peer < 0 else None
+
+    def dialog_title(self, owner, peer, obj):
+        if peer == owner:
+            return "Избранное"
+        if obj is not None:
+            if peer < 0:
+                return str(obj.title or f"Чат {peer}")
+            name = " ".join(str(part) for part in (obj.first_name, obj.last_name) if part)
+            if name:
+                return name
+            if obj.username:
+                return f"@{obj.username}"
+        return self.get_setting(f"names_{owner}", {}).get(str(peer), f"Чат {peer}")
+
+    def toggle_chat(self, context):
+        slot = context.get("account")
+        peer = context.get("dialog_id")
+        fragment = context.get("fragment")
+        if fragment is not None and hasattr(fragment, "getTopicId") and fragment.getTopicId():
+            BulletinHelper.show_error("Добавь группу из общего чата. Темы пока не поддерживаются.")
+            return
+        if slot is None or peer is None:
+            BulletinHelper.show_error("Не удалось определить аккаунт и чат.")
+            return
+        slot, peer = int(slot), int(peer)
+        owner = self.account_id(slot)
+        if not owner:
+            BulletinHelper.show_error("Сначала войди в аккаунт.")
+            return
+        selected = self.get_setting(f"chats_{owner}", [])
+        self.change_chat(slot, owner, peer, add=peer not in selected)
+
+    def change_chat(self, slot, owner, peer, *, add, refresh=False):
+        if not self.loaded or self.account_id(slot) != owner:
+            BulletinHelper.show_error("Аккаунт сменился. Открой список заново.")
+            return False
+        key = f"chats_{owner}"
+        peers = list(self.get_setting(key, []))
+        if (peer in peers) == add:
+            return False
+        names_key = f"names_{owner}"
+        names = dict(self.get_setting(names_key, {}))
+        if add:
+            obj = self.dialog_object(self.client(slot).get_messages_controller(), peer)
+            if obj is None and peer != owner:
+                BulletinHelper.show_error("Открой обычный чат, группу или канал.")
+                return False
+            peers.append(peer)
+            names[str(peer)] = self.dialog_title(owner, peer, obj)
+        else:
+            peers.remove(peer)
+            names.pop(str(peer), None)
+
+        paused = bool(self.job and self.job["enabled"] and self.job["owner"] == owner)
+        if paused:
+            self.pause("Список чатов изменён. Нажми «Старт».")
+        self.set_setting(names_key, names)
+        self.set_setting(key, peers, reload_settings=refresh)
+        message = "Чат добавлен." if add else "Чат убран."
+        if paused:
+            message += " Задание остановлено."
+        BulletinHelper.show_info(message)
+        return True
+
+    def manage_chats(self, _view=None):
+        slot = int(get_selected_account())
+        owner = self.account_id(slot)
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment is not None else None
+        if not owner or activity is None:
+            BulletinHelper.show_error("Открой настройки из нужного аккаунта.")
+            return
+        peers = self.get_setting(f"chats_{owner}", [])
+        controller = self.client(slot).get_messages_controller()
+        rows = []
+        for peer in peers:
+            obj = self.dialog_object(controller, peer)
+            rows.append((peer, self.dialog_title(owner, peer, obj), obj))
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Выбранные чаты")
+
+        def remove(peer, title):
+            builder.dismiss()
+            self.confirm_remove(activity, slot, owner, peer, title)
+
+        if not rows:
+            builder.set_message("Список пуст.")
+        else:
+            self.set_chat_rows(builder, activity, slot, owner, rows, "Убрать", remove)
+
+        def add(dialog, _index):
+            dialog.dismiss()
+            self.pick_chat(activity, slot, owner)
+
+        builder.set_positive_button("Добавить чат", add)
+        builder.set_negative_button("Закрыть")
+        builder.show()
+
+    def set_chat_rows(self, builder, activity, slot, owner, rows, action_text, action):
+        try:
+            builder.set_view(self.chat_list_view(activity, slot, owner, rows, action_text, action))
+        except Exception as error:
+            self.logger.error(f"Не удалось создать окно чатов: {error}")
+            builder.set_items([title for _, title, _ in rows],
+                              lambda _dialog, index: action(*rows[index][:2]))
+
+    def chat_list_view(self, activity, slot, owner, rows, action_text, on_chat):
+        from android.view import Gravity
+        from android.widget import LinearLayout, TextView
+        from android_utils import OnClickListener
+        from java import jclass, jfloat
+        from org.telegram.ui.ActionBar import Theme
+
+        density = float(activity.getResources().getDisplayMetrics().density)
+
+        def dp(value):
+            return int(value * density + 0.5)
+
+        params = jclass("android.widget.LinearLayout$LayoutParams")
+        truncate = jclass("android.text.TextUtils$TruncateAt").END
+        text_color = Theme.getColor(Theme.key_dialogTextBlack)
+        accent_color = Theme.getColor(Theme.key_dialogTextBlue)
+        content = LinearLayout(activity)
+        content.setOrientation(LinearLayout.VERTICAL)
+        for peer, title, obj in rows:
+            row = LinearLayout(activity)
+            row.setGravity(Gravity.CENTER_VERTICAL)
+            row.setPadding(dp(20), 0, dp(20), 0)
+            avatar = self.chat_avatar(activity, slot, owner, peer, title, obj, dp(18))
+            avatar_params = params(dp(36), dp(36))
+            avatar_params.setMarginEnd(dp(12))
+            row.addView(avatar, avatar_params)
+
+            label = TextView(activity)
+            label.setText(title)
+            label.setTextSize(jfloat(16))
+            label.setTextColor(text_color)
+            label.setSingleLine(True)
+            label.setEllipsize(truncate)
+            row.addView(label, params(0, -2, jfloat(1)))
+            if action_text:
+                action = TextView(activity)
+                action.setText(action_text)
+                action.setTextSize(jfloat(14))
+                action.setTextColor(accent_color)
+                action.setPadding(dp(8), 0, 0, 0)
+                row.addView(action)
+            row.setOnClickListener(OnClickListener(
+                lambda _view, chat=peer, name=title: on_chat(chat, name)))
+            content.addView(row, params(-1, dp(52)))
+        return content
+
+    def chat_avatar(self, activity, slot, owner, peer, title, obj, radius):
+        if obj is not None or peer == owner:
+            try:
+                from org.telegram.ui.Components import AvatarDrawable, BackupImageView
+
+                avatar = BackupImageView(activity)
+                receiver = avatar.getImageReceiver()
+                receiver.setCurrentAccount(slot)
+                avatar.setRoundRadius(radius)
+                placeholder = AvatarDrawable()
+                if peer == owner:
+                    placeholder.setAvatarType(AvatarDrawable.AVATAR_TYPE_SAVED)
+                    avatar.setImageDrawable(placeholder)
+                else:
+                    placeholder.setInfo(obj)
+                    receiver.setForUserOrChat(obj, placeholder)
+                return avatar
+            except Exception as error:
+                self.logger.info(f"Аватар {peer} недоступен: {error}")
+
+        from android.graphics import Color
+        from android.graphics.drawable import GradientDrawable
+        from android.view import Gravity
+        from android.widget import TextView
+        from java import jfloat
+
+        badge = TextView(activity)
+        initials = "".join(word[0].upper() for word in title.split()[:2]) or "?"
+        badge.setText(initials)
+        badge.setTextColor(Color.WHITE)
+        badge.setTextSize(jfloat(13))
+        badge.setGravity(Gravity.CENTER)
+        circle = GradientDrawable()
+        circle.setShape(GradientDrawable.OVAL)
+        palette = ((56, 111, 158), (109, 83, 157), (43, 126, 118), (145, 85, 109))
+        circle.setColor(Color.rgb(*palette[peer % len(palette)]))
+        badge.setBackground(circle)
+        return badge
+
+    def confirm_remove(self, activity, slot, owner, peer, title):
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Убрать из списка?")
+        builder.set_message(title)
+
+        def confirm(dialog, _index):
+            dialog.dismiss()
+            self.change_chat(slot, owner, peer, add=False, refresh=True)
+            self.manage_chats()
+
+        builder.set_positive_button("Убрать", confirm)
+        builder.set_negative_button("Отмена")
+        builder.show()
+
+    def pick_chat(self, activity, slot, owner):
+        if not self.loaded or self.account_id(slot) != owner:
+            BulletinHelper.show_error("Аккаунт сменился. Открой список заново.")
+            return
+        controller = self.client(slot).get_messages_controller()
+        seen = set(self.get_setting(f"chats_{owner}", []))
+        dialogs = (controller.getAllDialogs() if hasattr(controller, "getAllDialogs")
+                   else controller.getDialogs(0))
+        candidates = []
+        for peer in [owner] + [int(dialogs.get(i).id) for i in range(dialogs.size())]:
+            if peer in seen:
+                continue
+            seen.add(peer)
+            obj = self.dialog_object(controller, peer)
+            if obj is not None or peer == owner:
+                candidates.append((peer, self.dialog_title(owner, peer, obj), obj))
+        self.show_chat_picker(activity, slot, owner, candidates, 0)
+
+    def show_chat_picker(self, activity, slot, owner, candidates, offset):
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Добавить чат")
+        if not candidates:
+            builder.set_message("Открой нужный диалог в exteraGram или добавь его через меню ⋮.")
+        else:
+            def pick(peer, _title):
+                builder.dismiss()
+                self.change_chat(slot, owner, peer, add=True, refresh=True)
+                self.manage_chats()
+
+            rows = candidates[offset:offset + CHAT_PAGE_SIZE]
+            self.set_chat_rows(builder, activity, slot, owner, rows, "", pick)
+
+        if offset + CHAT_PAGE_SIZE < len(candidates):
+            def next_page(dialog, _index):
+                dialog.dismiss()
+                self.show_chat_picker(activity, slot, owner, candidates, offset + CHAT_PAGE_SIZE)
+
+            builder.set_positive_button("Дальше", next_page)
+
+        def back(dialog, _index):
+            dialog.dismiss()
+            if offset:
+                self.show_chat_picker(activity, slot, owner, candidates, offset - CHAT_PAGE_SIZE)
+            else:
+                self.manage_chats()
+
+        builder.set_negative_button("Назад", back)
+        builder.show()
+
+    def show_status(self, _view):
+        BulletinHelper.show_info(self.get_setting("status", "Заданий ещё не было."))
+
+    def record(self, message):
+        self.set_setting("status", f"{strftime('%H:%M:%S')} · {message}")
+        self.logger.info(message)
+
+    def start(self, _view):
+        if self.inflight is not None:
+            BulletinHelper.show_info("Дождись ответа на предыдущую отправку.")
+            return
+        if self.job and self.job["enabled"]:
+            BulletinHelper.show_info("Нажми «Стоп», чтобы применить новые настройки.")
+            return
+        slot = int(get_selected_account())
+        owner = self.account_id(slot)
+        peers = list(self.get_setting(f"chats_{owner}", []))
+        body = str(self.get_setting("body", "")).strip()
+        photos = list(self.get_setting(f"photos_{owner}", []))
+        unit = self.get_setting("interval_unit", 0)
+        _, label, multiplier = INTERVAL_UNITS[1 if unit == 1 else 0]
+        previous_interval = self.get_setting("minutes", "60")
+        try:
+            interval = int(self.get_setting("interval", previous_interval))
+        except (ValueError, TypeError):
+            interval = 0
+        if not owner or not peers or not (body or photos):
+            BulletinHelper.show_error("Выбери чаты и добавь текст или фото.")
+            return
+        period = interval * multiplier
+        if not 1 <= period <= MAX_PERIOD:
+            BulletinHelper.show_error(f"Интервал от 1 до {MAX_PERIOD // multiplier} {label}.")
+            return
+        self.generation += 1
+        self.job = {
+            "enabled": True, "slot": slot, "owner": owner, "peers": peers,
+            "body": body, "photos": photos, "period": period, "due": time(),
+            "replace": bool(self.get_setting("replace_old", False)),
+        }
+        self.record(f"Запуск · каждые {interval} {label}")
+        self.set_setting("job", self.job, reload_settings=True)
+        self.plan(self.generation)
+
+    def stop(self, _view):
+        self.pause("Остановлено вручную.", reload_settings=True)
+
+    def pause(self, reason, reload_settings=False):
+        self.generation += 1
+        self.round_active = False
+        self.record(reason)
+        if self.job:
+            self.job["enabled"] = False
+            self.set_setting("job", self.job, reload_settings=reload_settings)
+
+    def running(self, generation):
+        return self.loaded and generation == self.generation and self.job and self.job["enabled"]
+
+    def plan(self, generation):
+        if not self.running(generation):
+            return
+        delay = min(60_000, max(0, int((self.job["due"] - time()) * 1000)))
+        run_on_ui_thread(lambda: self.tick(generation), max(100, delay))
+
+    def tick(self, generation):
+        if not self.running(generation):
+            return
+        if time() < self.job["due"]:
+            self.plan(generation)
+            return
+        if self.round_active or self.inflight is not None:
+            run_on_ui_thread(lambda: self.tick(generation), 1000)
+            return
+        # Advance before dispatch. After restart we do at most one overdue round.
+        self.job["due"] = time() + self.job["period"]
+        self.set_setting("job", self.job)
+        self.round_active = True
+        self.plan(generation)
+        self.send_next(generation, 0)
+
+    def send_next(self, generation, index):
+        if not self.running(generation):
+            return
+        job = self.job
+        peer = int(job["peers"][index])
+
+        def advance():
+            if not self.running(generation):
+                return
+            if index + 1 >= len(job["peers"]):
+                self.round_active = False
+            else:
+                run_on_ui_thread(lambda: self.send_next(generation, index + 1), 1000)
+
+        try:
+            if self.account_id(job["slot"]) != job["owner"]:
+                self.pause("Аккаунт вышел или был заменён. Запусти задание заново.")
+                return
+            client = self.client(job["slot"])
+            controller = client.get_messages_controller()
+            if peer != job["owner"] and self.dialog_object(controller, peer) is None:
+                self.record(f"Чат {peer} недоступен. Открой его в этом аккаунте.")
+                advance()
+                return
+            parts = [("text", text) for text in split_text(job["body"])]
+            if job.get("photos"):
+                parts.append(("photos", job["photos"]))
+            if parts:
+                self.send_part(generation, job, peer, controller, client, parts, [], advance)
+            else:
+                advance()
+        except Exception as error:
+            self.record(f"Чат {peer}: ошибка запуска отправки.")
+            self.logger.error(str(error))
+            advance()
+
+    def send_part(self, generation, job, peer, controller, client, parts, sent_ids, advance):
+        if not self.running(generation):
+            return
+        if self.account_id(job["slot"]) != job["owner"]:
+            self.pause("Аккаунт вышел или был заменён.")
+            return
+        kind, content = parts[0]
+        try:
+            destination = controller.getInputPeer(peer)
+            if kind == "text":
+                request = TLRPC.TL_messages_sendMessage()
+                request.peer = destination
+                request.message = content
+                request.random_id = randbits(63) or 1
+                random_ids = [int(request.random_id)]
+            else:
+                request = TLRPC.TL_messages_forwardMessages()
+                request.from_peer = TLRPC.TL_inputPeerSelf()
+                request.to_peer = destination
+                request.drop_author = True
+                request.drop_media_captions = True
+                random_ids = []
+                for photo in content:
+                    random_id = randbits(63) or 1
+                    request.id.add(Integer(photo))
+                    request.random_id.add(Long(random_id))
+                    random_ids.append(random_id)
+            self.request(client, request, advance, lambda response, error: self.sent_part(
+                generation, job, peer, controller, client, parts, sent_ids,
+                random_ids, response, error, advance,
+            ))
+        except Exception as error:
+            self.logger.error(str(error))
+            self.post_error(job, peer, sent_ids, f"Ошибка отправки: {type(error).__name__}.", advance)
+
+    def request(self, client, request, advance, callback):
+        # SDK callbacks can arrive off the UI thread. All state changes run on it.
+        ticket = object()
+        self.inflight = ticket
+
+        def finish(response, error):
+            if self.inflight is not ticket:
+                return
+            self.inflight = None
+            if self.loaded:
+                try:
+                    callback(response, error)
+                except Exception as exc:
+                    self.record(f"Ошибка обработки ответа: {type(exc).__name__}.")
+                    self.logger.error(str(exc))
+                    advance()
+
+        def receive(response, error):
+            error_text = str(getattr(error, "text", error)) if error is not None else ""
+            run_on_ui_thread(lambda: finish(response, error_text))
+
+        try:
+            client.send_request(request, receive)
+        except Exception:
+            self.inflight = None
+            raise
+        run_on_ui_thread(lambda: finish(None, "Нет подтверждения от Telegram"), 60_000)
+
+    def sent_part(self, generation, job, peer, controller, client, parts, sent_ids,
+                  random_ids, response, error, advance):
+        if self.account_id(job["slot"]) != job["owner"]:
+            if self.running(generation):
+                self.pause("Аккаунт вышел или был заменён.")
+            return
+        active = self.running(generation)
+        ids = []
+        if not error:
+            try:
+                ids = confirmed_message_ids(response, random_ids)
+                if tl_name(response) == "TL_updateShortSentMessage":
+                    controller.getDifference()
+                elif response is not None:
+                    controller.processUpdates(response, False)
+            except Exception as sync_error:
+                self.logger.error(f"Ошибка обработки ответа: {sync_error}")
+        delivered = sent_ids + ids
+        if error or len(ids) != len(random_ids):
+            detail = error or "Telegram не подтвердил все сообщения."
+            if error == "MESSAGE_ID_INVALID" and parts[0][0] == "photos":
+                detail = "Фото недоступно. Проверь фотографии в «Избранном»."
+            if active:
+                self.post_error(job, peer, delivered, detail, advance)
+            else:
+                self.remember_partial(job, peer, delivered)
+            return
+
+        if len(parts) > 1:
+            if active:
+                self.send_part(generation, job, peer, controller, client, parts[1:],
+                               delivered, advance)
+            else:
+                self.remember_partial(job, peer, delivered)
+            return
+
+        key = f"last_{job['owner']}_{peer}"
+        keep = set(delivered)
+        if peer == job["owner"]:
+            keep.update(job.get("photos", []))
+            keep.update(self.get_setting(f"photos_{peer}", []))
+        old_ids = [msg_id for msg_id in self.last_ids(key) if msg_id not in keep]
+        self.set_setting(key, delivered)
+        if not active:
+            return
+        self.record(f"Отправлено в {peer} · сообщений: {len(delivered)}.")
+        if not job["replace"] or not old_ids:
+            advance()
+            return
+
+        try:
+            self.delete_previous(client, controller, peer, old_ids, generation, advance)
+        except Exception as error:
+            self.record(f"Чат {peer}: запрос удаления не запустился.")
+            self.logger.error(str(error))
+            advance()
+
+    def last_ids(self, key):
+        saved = self.get_setting(key, 0)
+        if isinstance(saved, list):
+            return saved
+        return [int(saved)] if saved else []
+
+    def remember_partial(self, job, peer, sent_ids):
+        if sent_ids:
+            key = f"last_{job['owner']}_{peer}"
+            self.set_setting(key, list(dict.fromkeys(self.last_ids(key) + sent_ids)))
+
+    def post_error(self, job, peer, sent_ids, error, advance):
+        self.remember_partial(job, peer, sent_ids)
+        if sent_ids:
+            self.pause(f"Отправлено частично: {error} Предыдущее объявление сохранено.")
+        elif error.startswith(("FLOOD_", "PEER_FLOOD", "SLOWMODE_WAIT")):
+            self.pause(f"Telegram ограничил отправку: {error}.")
+        else:
+            self.record(f"Чат {peer}: {error}")
+            advance()
+
+    def delete_previous(self, client, controller, peer, old_ids, generation, advance):
+        input_peer = controller.getInputPeer(peer)
+        is_channel = isinstance(input_peer, TLRPC.TL_inputPeerChannel)
+        if is_channel:
+            request = TLRPC.TL_channels_deleteMessages()
+            request.channel = controller.getInputChannel(-peer)
+        elif isinstance(input_peer, (TLRPC.TL_inputPeerChat, TLRPC.TL_inputPeerUser,
+                                     TLRPC.TL_inputPeerSelf)):
+            request = TLRPC.TL_messages_deleteMessages()
+            request.revoke = True
+        else:
+            self.record(f"Чат {peer}: тип чата не поддерживает удаление в этой версии.")
+            advance()
+            return
+        for msg_id in old_ids:
+            request.id.add(Integer(msg_id))
+
+        def deleted(response, error):
+            if not self.running(generation):
+                return
+            if error:
+                self.record(f"Чат {peer}: удаление не удалось. {error}.")
+            else:
+                self.record(f"Чат {peer}: удалено сообщений: {len(old_ids)}.")
+                if self.account_id(self.job["slot"]) == self.job["owner"]:
+                    try:
+                        if is_channel:
+                            update = TL_update.TL_updateDeleteChannelMessages()
+                            update.channel_id = -peer
+                        else:
+                            update = TL_update.TL_updateDeleteMessages()
+                        for msg_id in old_ids:
+                            update.messages.add(Integer(msg_id))
+                        update.pts = response.pts
+                        update.pts_count = response.pts_count
+                        wrapped = TLRPC.TL_updateShort()
+                        wrapped.date = int(time())
+                        wrapped.update = update
+                        controller.processUpdates(wrapped, False)
+                    except Exception as sync_error:
+                        self.logger.error(f"Ошибка обновления чата после удаления: {sync_error}")
+            advance()
+
+        self.request(client, request, advance, deleted)
